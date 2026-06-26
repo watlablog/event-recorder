@@ -1,0 +1,5 @@
+ultralytics
+opencv-python
+PyYAML
+pytest
+PyQt5

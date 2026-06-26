@@ -1,0 +1,47 @@
+camera:
+  source: 0
+  width: 1280
+  height: 720
+  requested_fps: 30
+  fallback_fps: 30.0
+  reconnect_attempts: 10
+  reconnect_interval_seconds: 0.5
+
+model:
+  path: yolo26n.pt
+  target_classes:
+    - person
+    - car
+  confidence: 0.40
+  iou: 0.70
+  image_size: 640
+  device: null
+  half: false
+  max_detection_fps: 0
+
+start_confirmation:
+  window_results: 3
+  required_positive_results: 2
+  expire_seconds: 2.0
+
+recording:
+  output_directory: recordings
+  extension: mp4
+  fourcc: mp4v
+  pre_event_seconds: 1.0
+  post_event_seconds: 3.0
+  max_clip_seconds: 600
+  max_prebuffer_mb: 256
+  minimum_free_disk_gb: 2.0
+
+health:
+  detector_stale_seconds: 5.0
+  detector_failure_seconds: 30.0
+
+preview:
+  enabled: true
+  draw_boxes: true
+  show_fps: true
+
+logging:
+  level: INFO
