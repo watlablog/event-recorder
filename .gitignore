@@ -4,6 +4,8 @@ venv/
 recordings/
 *.pt
 *_partial.mp4
+*_partial.wav
+*_muxed_partial.mp4
 __pycache__/
 .pytest_cache/
 .DS_Store

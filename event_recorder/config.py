@@ -65,6 +65,15 @@ class PreviewConfig:
 
 
 @dataclass(frozen=True)
+class AudioConfig:
+    enabled: bool
+    device: int | str | None
+    sample_rate: int
+    channels: int
+    fallback_to_video_only: bool
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     level: str
 
@@ -77,6 +86,7 @@ class AppConfig:
     recording: RecordingConfig
     health: HealthConfig
     preview: PreviewConfig
+    audio: AudioConfig
     logging: LoggingConfig
 
 
@@ -105,6 +115,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     recording = _mapping(raw, "recording")
     health = _mapping(raw, "health")
     preview = _mapping(raw, "preview")
+    audio = _mapping(raw, "audio")
     logging = _mapping(raw, "logging")
 
     config = AppConfig(
@@ -152,6 +163,13 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
             enabled=bool(preview.get("enabled", True)),
             draw_boxes=bool(preview.get("draw_boxes", True)),
             show_fps=bool(preview.get("show_fps", True)),
+        ),
+        audio=AudioConfig(
+            enabled=bool(audio.get("enabled", False)),
+            device=_optional_device(audio.get("device")),
+            sample_rate=_int(audio, "sample_rate", 48000),
+            channels=_int(audio, "channels", 1),
+            fallback_to_video_only=bool(audio.get("fallback_to_video_only", True)),
         ),
         logging=LoggingConfig(level=str(logging.get("level", "INFO"))),
     )
@@ -222,6 +240,11 @@ def validate_config(config: AppConfig) -> None:
             "health.detector_failure_seconds must be greater than detector_stale_seconds."
         )
 
+    if config.audio.sample_rate <= 0:
+        raise ConfigError("audio.sample_rate must be positive.")
+    if config.audio.channels <= 0:
+        raise ConfigError("audio.channels must be positive.")
+
 
 def _mapping(raw: dict[str, Any], key: str) -> dict[str, Any]:
     value = raw.get(key, {})
@@ -255,3 +278,21 @@ def _camera_source(value: Any) -> int | str:
             raise ConfigError("camera.source must not be empty.")
         return value
     raise ConfigError("camera.source must be an integer device index or path.")
+
+
+def _optional_device(value: Any) -> int | str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ConfigError("audio.device must be an integer device index, name, or null.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    raise ConfigError("audio.device must be an integer device index, name, or null.")

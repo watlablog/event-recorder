@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from event_recorder.audio import AudioCapture, AudioClipWriter, AudioError, AudioPreBuffer
 from event_recorder.camera import (
     CameraReadError,
     CameraStream,
@@ -84,6 +85,10 @@ class RecorderEngine:
         )
         writer: VideoClipWriter | None = None
         latest_detections: tuple[DetectedObject, ...] = ()
+        audio_capture: AudioCapture | None = None
+        audio_prebuffer: AudioPreBuffer | None = None
+        audio_writer: AudioClipWriter | None = None
+        audio_status = "disabled" if not self.config.audio.enabled else "not_started"
         part = 1
         current_event_id: str | None = None
         pending_continuation = False
@@ -110,6 +115,7 @@ class RecorderEngine:
                 )
             detector.start()
             detector_started = True
+            audio_capture, audio_prebuffer, audio_status = self._start_audio_capture()
             self._status(RecorderStatus.WAITING, "Waiting for target detection")
 
             frame_id = 1
@@ -117,10 +123,20 @@ class RecorderEngine:
                 now = packet.captured_at_monotonic
                 frame_times.append(now)
                 prebuffer.add(packet)
+                audio_capture, audio_status = self._drain_audio(
+                    audio_capture,
+                    audio_prebuffer,
+                    audio_writer,
+                    audio_status,
+                )
                 put_latest(detector_input, packet)
 
                 failure_code = self._handle_detector_failures(
-                    detector_failures, writer, packet
+                    detector_failures,
+                    writer,
+                    audio_writer,
+                    packet,
+                    audio_status,
                 )
                 if failure_code is not None:
                     return failure_code
@@ -149,11 +165,25 @@ class RecorderEngine:
                         current_event_id = writer.paths.event_id
                         part = 1
                         writer.observe_detection(result)
+                        audio_writer, audio_status = self._start_audio_clip(
+                            writer,
+                            audio_prebuffer,
+                            event_start_monotonic,
+                            audio_capture,
+                            audio_status,
+                        )
                         self._status(RecorderStatus.RECORDING, "Recording event")
 
                 health = state.detector_health(time.monotonic())
                 if health == DetectorHealth.FAILED:
-                    _close_writer(writer, StopReason.DETECTOR_FAILURE, packet)
+                    _close_clip(
+                        writer,
+                        audio_writer,
+                        self.config,
+                        StopReason.DETECTOR_FAILURE,
+                        packet,
+                        audio_status,
+                    )
                     self._error("Detector failed to return results.")
                     return 2
 
@@ -169,6 +199,13 @@ class RecorderEngine:
                         part=part,
                         prebuffer=None,
                     )
+                    audio_writer, audio_status = self._start_audio_clip(
+                        writer,
+                        None,
+                        packet.captured_at_monotonic,
+                        audio_capture,
+                        audio_status,
+                    )
                     pending_continuation = False
                     self._status(RecorderStatus.RECORDING, "Recording next clip part")
 
@@ -181,12 +218,32 @@ class RecorderEngine:
                         packet.captured_at_monotonic
                     )
                     if split_decision.should_stop:
-                        _close_writer(writer, StopReason.MAX_CLIP_DURATION, packet)
+                        _close_clip(
+                            writer,
+                            audio_writer,
+                            self.config,
+                            StopReason.MAX_CLIP_DURATION,
+                            packet,
+                            audio_status,
+                        )
                         writer = None
+                        audio_writer = None
+                        if audio_capture is not None:
+                            audio_status = "capturing"
                         pending_continuation = True
                     elif absence_decision.should_stop:
-                        _close_writer(writer, StopReason.TARGET_ABSENT, packet)
+                        _close_clip(
+                            writer,
+                            audio_writer,
+                            self.config,
+                            StopReason.TARGET_ABSENT,
+                            packet,
+                            audio_status,
+                        )
                         writer = None
+                        audio_writer = None
+                        if audio_capture is not None:
+                            audio_status = "capturing"
                         state.mark_recording_stopped()
                         current_event_id = None
                         part = 1
@@ -219,11 +276,28 @@ class RecorderEngine:
                 try:
                     packet = camera.read_packet(frame_id)
                 except EndOfInput:
-                    _close_writer(writer, StopReason.END_OF_FILE, packet)
+                    _close_clip(
+                        writer,
+                        audio_writer,
+                        self.config,
+                        StopReason.END_OF_FILE,
+                        packet,
+                        audio_status,
+                    )
                     return 0
                 except CameraReadError:
-                    _close_writer(writer, StopReason.CAMERA_FAILURE, packet)
+                    _close_clip(
+                        writer,
+                        audio_writer,
+                        self.config,
+                        StopReason.CAMERA_FAILURE,
+                        packet,
+                        audio_status,
+                    )
                     writer = None
+                    audio_writer = None
+                    if audio_capture is not None:
+                        audio_status = "capturing"
                     state.mark_recording_stopped()
                     if camera.is_file_source or not camera.reopen_with_retries():
                         self._error("Failed to read from camera.")
@@ -231,7 +305,14 @@ class RecorderEngine:
                     packet = camera.read_packet(frame_id)
 
             if writer is not None:
-                _close_writer(writer, StopReason.USER_SHUTDOWN, packet)
+                _close_clip(
+                    writer,
+                    audio_writer,
+                    self.config,
+                    StopReason.USER_SHUTDOWN,
+                    packet,
+                    audio_status,
+                )
             return 0
         except VideoWriterError as exc:
             self._error(str(exc))
@@ -240,13 +321,17 @@ class RecorderEngine:
             self.stop_event.set()
             if detector_started:
                 detector.join(timeout=5)
+            if audio_capture is not None:
+                audio_capture.stop()
             camera.release()
 
     def _handle_detector_failures(
         self,
         failure_queue: queue.Queue[DetectorFailure],
         writer: VideoClipWriter | None,
+        audio_writer: AudioClipWriter | None,
         packet: FramePacket,
+        audio_status: str,
     ) -> int | None:
         try:
             failure = failure_queue.get_nowait()
@@ -254,8 +339,82 @@ class RecorderEngine:
             return None
         LOGGER.error("Detector failed: %s", failure.message)
         self._error(f"Detector failed: {failure.message}")
-        _close_writer(writer, StopReason.DETECTOR_FAILURE, packet)
+        _close_clip(
+            writer,
+            audio_writer,
+            self.config,
+            StopReason.DETECTOR_FAILURE,
+            packet,
+            audio_status,
+        )
         return 2
+
+    def _start_audio_capture(
+        self,
+    ) -> tuple[AudioCapture | None, AudioPreBuffer | None, str]:
+        if not self.config.audio.enabled:
+            return None, None, "disabled"
+        try:
+            audio_capture = AudioCapture(self.config.audio)
+            audio_capture.start()
+            audio_prebuffer = AudioPreBuffer(
+                self.config.recording.pre_event_seconds,
+                self.config.audio.sample_rate,
+            )
+            return audio_capture, audio_prebuffer, "capturing"
+        except Exception as exc:
+            self._error(f"Audio disabled: {exc}")
+            if not self.config.audio.fallback_to_video_only:
+                raise AudioError(str(exc)) from exc
+            return None, None, "capture_failed"
+
+    def _drain_audio(
+        self,
+        audio_capture: AudioCapture | None,
+        audio_prebuffer: AudioPreBuffer | None,
+        audio_writer: AudioClipWriter | None,
+        audio_status: str,
+    ) -> tuple[AudioCapture | None, str]:
+        if audio_capture is None:
+            return None, audio_status
+        try:
+            blocks = audio_capture.drain()
+        except AudioError as exc:
+            self._error(f"Audio disabled: {exc}")
+            audio_capture.stop()
+            return None, "capture_failed"
+        for block in blocks:
+            if audio_prebuffer is not None:
+                audio_prebuffer.add(block)
+            if audio_writer is not None:
+                audio_writer.write(block)
+        return audio_capture, audio_status
+
+    def _start_audio_clip(
+        self,
+        writer: VideoClipWriter,
+        audio_prebuffer: AudioPreBuffer | None,
+        event_start_monotonic: float,
+        audio_capture: AudioCapture | None,
+        audio_status: str,
+    ) -> tuple[AudioClipWriter | None, str]:
+        if not self.config.audio.enabled:
+            return None, "disabled"
+        if audio_capture is None:
+            return None, audio_status
+        try:
+            audio_writer = AudioClipWriter(
+                writer.paths.partial_audio_path,
+                self.config.audio.sample_rate,
+                self.config.audio.channels,
+            )
+            if audio_prebuffer is not None:
+                for block in audio_prebuffer.blocks_for_event(event_start_monotonic):
+                    audio_writer.write(block)
+            return audio_writer, "captured"
+        except Exception as exc:
+            self._error(f"Audio disabled for this clip: {exc}")
+            return None, "write_failed"
 
     def _frame(self, frame: EngineFrame) -> bool:
         if self.callbacks.on_frame is None:
@@ -318,17 +477,38 @@ def _start_writer(
     return writer
 
 
-def _close_writer(
+def _close_clip(
     writer: VideoClipWriter | None,
+    audio_writer: AudioClipWriter | None,
+    config: AppConfig,
     reason: StopReason,
     packet: FramePacket | None,
+    audio_status: str,
 ) -> None:
     if writer is None or packet is None:
         return
+    audio_path = None
+    final_audio_status = audio_status
+    if audio_writer is not None:
+        audio_writer.close()
+        if audio_writer.frames_written > 0:
+            audio_path = audio_writer.path
+            final_audio_status = "captured"
+        else:
+            final_audio_status = "no_audio_samples"
+    elif config.audio.enabled and audio_status in {"capturing", "captured"}:
+        final_audio_status = "no_audio_samples"
+
     writer.close(
         reason,
         ended_at_wall_clock=packet.captured_at_wall_clock,
         ended_at_monotonic=packet.captured_at_monotonic,
+        audio_path=audio_path,
+        audio_requested=config.audio.enabled,
+        audio_status=final_audio_status,
+        audio_device=config.audio.device,
+        audio_sample_rate=config.audio.sample_rate if config.audio.enabled else None,
+        audio_channels=config.audio.channels if config.audio.enabled else None,
     )
 
 

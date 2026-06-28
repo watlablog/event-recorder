@@ -35,6 +35,10 @@ GUI mode is available separately:
 ./venv/bin/python smart_recorder_gui.py
 ```
 
+In GUI mode, enable `Enable Audio` and choose a microphone to mux microphone
+audio into finalized clips. If audio capture or muxing fails, the app keeps the
+video-only MP4 and records the audio status in the JSON metadata.
+
 The default configuration records MP4 clips under `recordings/YYYY-MM-DD/` when
 `person` or `car` is detected. Each finalized clip gets a matching JSON metadata
 file. Files still being written use a `_partial` suffix.

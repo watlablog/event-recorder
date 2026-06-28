@@ -73,3 +73,38 @@ def test_recorder_engine_releases_camera_and_detector_on_stop(monkeypatch):
     assert FakeDetectorWorker.last_instance is not None
     assert FakeDetectorWorker.last_instance.started
     assert FakeDetectorWorker.last_instance.joined
+
+
+class FailingAudioCapture:
+    def __init__(self, config):
+        self.config = config
+
+    def start(self) -> None:
+        raise RuntimeError("no microphone permission")
+
+    def stop(self) -> None:
+        pass
+
+
+def test_recorder_engine_continues_video_when_audio_start_fails(monkeypatch):
+    config = parse_config(
+        {
+            "model": {"target_classes": ["person", "car"]},
+            "audio": {"enabled": True, "fallback_to_video_only": True},
+        }
+    )
+    stop_event = threading.Event()
+    stop_event.set()
+    errors: list[str] = []
+    monkeypatch.setattr(engine, "CameraStream", FakeCameraStream)
+    monkeypatch.setattr(engine, "DetectorWorker", FakeDetectorWorker)
+    monkeypatch.setattr(engine, "AudioCapture", FailingAudioCapture)
+
+    code = engine.RecorderEngine(
+        config,
+        stop_event,
+        engine.EngineCallbacks(on_error=errors.append),
+    ).run()
+
+    assert code == 0
+    assert any("Audio disabled" in error for error in errors)

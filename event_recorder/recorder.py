@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from event_recorder.audio import AudioMuxError, mux_audio_video
 from event_recorder.config import RecordingConfig
 from event_recorder.models import DetectionResult, EventPaths, FramePacket, StopReason
 from event_recorder.storage import write_metadata
@@ -78,12 +79,48 @@ class VideoClipWriter:
         stop_reason: StopReason,
         ended_at_wall_clock: datetime,
         ended_at_monotonic: float,
+        audio_path: Path | None = None,
+        audio_requested: bool = False,
+        audio_status: str = "disabled",
+        audio_device: int | str | None = None,
+        audio_sample_rate: int | None = None,
+        audio_channels: int | None = None,
     ) -> None:
         self._writer.release()
-        Path(self.paths.partial_video_path).rename(self.paths.final_video_path)
+        audio_recorded = False
+        final_audio_status = audio_status
+        partial_video_path = Path(self.paths.partial_video_path)
+        final_video_path = Path(self.paths.final_video_path)
+        muxed_partial_path = Path(self.paths.muxed_partial_video_path)
+
+        if audio_path is not None and audio_path.exists() and audio_status == "captured":
+            try:
+                mux_audio_video(partial_video_path, audio_path, muxed_partial_path)
+                muxed_partial_path.rename(final_video_path)
+                _unlink_if_exists(partial_video_path)
+                _unlink_if_exists(audio_path)
+                audio_recorded = True
+                final_audio_status = "muxed"
+            except AudioMuxError:
+                partial_video_path.rename(final_video_path)
+                _unlink_if_exists(muxed_partial_path)
+                final_audio_status = "mux_failed"
+        else:
+            partial_video_path.rename(final_video_path)
+
         write_metadata(
             Path(self.paths.metadata_path),
-            self._metadata(stop_reason, ended_at_wall_clock, ended_at_monotonic),
+            self._metadata(
+                stop_reason,
+                ended_at_wall_clock,
+                ended_at_monotonic,
+                audio_requested=audio_requested,
+                audio_recorded=audio_recorded,
+                audio_status=final_audio_status,
+                audio_device=audio_device,
+                audio_sample_rate=audio_sample_rate,
+                audio_channels=audio_channels,
+            ),
         )
 
     def _metadata(
@@ -91,6 +128,12 @@ class VideoClipWriter:
         stop_reason: StopReason,
         ended_at_wall_clock: datetime,
         ended_at_monotonic: float,
+        audio_requested: bool,
+        audio_recorded: bool,
+        audio_status: str,
+        audio_device: int | str | None,
+        audio_sample_rate: int | None,
+        audio_channels: int | None,
     ) -> dict[str, Any]:
         return {
             "event_id": self.paths.event_id,
@@ -109,6 +152,12 @@ class VideoClipWriter:
             "detected_classes": sorted(self.detected_classes),
             "max_confidence_by_class": self.max_confidence_by_class,
             "stop_reason": stop_reason.value,
+            "audio_requested": audio_requested,
+            "audio_recorded": audio_recorded,
+            "audio_status": audio_status,
+            "audio_device": audio_device,
+            "audio_sample_rate": audio_sample_rate,
+            "audio_channels": audio_channels,
         }
 
 

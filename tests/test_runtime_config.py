@@ -19,3 +19,20 @@ def test_runtime_config_replaces_camera_and_target_classes_only():
     assert updated.recording.output_directory == config.recording.output_directory
     assert config.camera.source == 0
     assert config.model.target_classes == ("person", "car")
+
+
+def test_runtime_config_replaces_audio_selection():
+    config = parse_config({"model": {"target_classes": ["person", "car"]}})
+
+    updated = with_runtime_selection(
+        config,
+        camera_source=1,
+        target_classes=("person",),
+        audio_enabled=True,
+        audio_device=4,
+    )
+
+    assert updated.audio.enabled is True
+    assert updated.audio.device == 4
+    assert config.audio.enabled is False
+    assert config.audio.device is None

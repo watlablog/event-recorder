@@ -43,5 +43,12 @@ preview:
   draw_boxes: true
   show_fps: true
 
+audio:
+  enabled: false
+  device: null
+  sample_rate: 48000
+  channels: 1
+  fallback_to_video_only: true
+
 logging:
   level: INFO

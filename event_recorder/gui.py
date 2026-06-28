@@ -10,6 +10,7 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -27,6 +28,7 @@ from PyQt5.QtWidgets import (
 )
 
 from event_recorder.__main__ import default_config_path, resolve_config_path
+from event_recorder.audio import MicrophoneCandidate, discover_microphones
 from event_recorder.camera_discovery import CameraCandidate, discover_cameras
 from event_recorder.config import AppConfig, ConfigError, load_config
 from event_recorder.engine import EngineCallbacks, EngineFrame, RecorderEngine
@@ -143,6 +145,7 @@ class MainWindow(QMainWindow):
         self.available_classes: tuple[DetectionClass, ...] = ()
         self.selected_classes: tuple[str, ...] = DEFAULT_TARGET_CLASSES
         self.cameras: list[CameraCandidate] = []
+        self.microphones: list[MicrophoneCandidate] = []
         self._model_thread: QThread | None = None
         self._model_worker: ModelClassesWorker | None = None
         self._recorder_thread: QThread | None = None
@@ -153,7 +156,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Event Recorder")
         self._build_ui()
-        self._discover_cameras()
+        self._refresh_devices()
         self._load_model_classes()
         self._update_controls()
 
@@ -165,6 +168,10 @@ class MainWindow(QMainWindow):
         self.preview_label.setStyleSheet(PREVIEW_BASE_STYLE)
 
         self.camera_combo = QComboBox()
+        self.audio_checkbox = QCheckBox("Enable Audio")
+        self.audio_checkbox.setChecked(self.config.audio.enabled)
+        self.audio_checkbox.stateChanged.connect(lambda _state: self._update_controls())
+        self.microphone_combo = QComboBox()
         self.objects_button = QPushButton("Objects to Detect")
         self.objects_button.clicked.connect(self._open_objects_dialog)
         self.rec_button = QPushButton("Rec")
@@ -173,6 +180,9 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Camera"))
         controls.addWidget(self.camera_combo, stretch=1)
+        controls.addWidget(self.audio_checkbox)
+        controls.addWidget(QLabel("Microphone"))
+        controls.addWidget(self.microphone_combo, stretch=1)
         controls.addWidget(self.objects_button)
         controls.addWidget(self.rec_button)
 
@@ -185,9 +195,14 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Loading")
 
-        refresh_action = QAction("Refresh Cameras", self)
-        refresh_action.triggered.connect(self._discover_cameras)
+        refresh_action = QAction("Refresh Devices", self)
+        refresh_action.triggered.connect(self._refresh_devices)
         self.menuBar().addAction(refresh_action)
+
+    def _refresh_devices(self) -> None:
+        self._discover_cameras()
+        self._discover_microphones()
+        self._update_controls()
 
     def _discover_cameras(self) -> None:
         self.statusBar().showMessage("Scanning cameras")
@@ -208,6 +223,30 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Loading model classes")
         self._update_controls()
+
+    def _discover_microphones(self) -> None:
+        self.microphone_combo.clear()
+        try:
+            self.microphones = discover_microphones()
+        except Exception as exc:
+            self.microphones = []
+            self.microphone_combo.addItem("No microphone found", None)
+            self.statusBar().showMessage(f"Microphone scan failed: {exc}")
+            self._update_controls()
+            return
+
+        for microphone in self.microphones:
+            self.microphone_combo.addItem(microphone.label, microphone.index)
+        if not self.microphones:
+            self.microphone_combo.addItem("No microphone found", None)
+            return
+
+        if self.config.audio.device is not None:
+            target = self.config.audio.device
+            for row in range(self.microphone_combo.count()):
+                if self.microphone_combo.itemData(row) == target:
+                    self.microphone_combo.setCurrentIndex(row)
+                    break
 
     def _load_model_classes(self) -> None:
         self._model_thread = QThread(self)
@@ -259,11 +298,18 @@ class MainWindow(QMainWindow):
         if not self.selected_classes:
             self.statusBar().showMessage("Select at least one object")
             return
+        audio_enabled = self.audio_checkbox.isChecked()
+        audio_device = self.microphone_combo.currentData() if audio_enabled else None
+        if audio_enabled and audio_device is None:
+            self.statusBar().showMessage("Select a microphone or disable audio")
+            return
 
         runtime_config = with_runtime_selection(
             self.config,
             camera_source=int(camera_index),
             target_classes=self.selected_classes,
+            audio_enabled=audio_enabled,
+            audio_device=audio_device,
         )
         self._stop_event = threading.Event()
         self._recorder_thread = QThread(self)
@@ -355,13 +401,25 @@ class MainWindow(QMainWindow):
 
     def _update_controls(self) -> None:
         has_camera = bool(self.cameras)
+        has_microphone = bool(self.microphones)
         has_classes = bool(self.available_classes)
         has_selection = bool(self.selected_classes)
+        audio_enabled = self.audio_checkbox.isChecked()
         self.camera_combo.setEnabled(not self._running and has_camera)
+        self.audio_checkbox.setEnabled(not self._running)
+        self.microphone_combo.setEnabled(
+            not self._running and audio_enabled and has_microphone
+        )
         self.objects_button.setEnabled(not self._running and has_classes)
         self.rec_button.setText("Stop" if self._running else "Rec")
         self.rec_button.setEnabled(
-            self._running or (has_camera and has_classes and has_selection)
+            self._running
+            or (
+                has_camera
+                and has_classes
+                and has_selection
+                and (not audio_enabled or has_microphone)
+            )
         )
 
     def _set_preview_recording(self, recording: bool) -> None:

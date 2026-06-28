@@ -36,6 +36,8 @@ def create_event_paths(
         event_id=event_id,
         part=part,
         partial_video_path=day_dir / f"{stem}_partial.{extension}",
+        partial_audio_path=day_dir / f"{stem}_partial.wav",
+        muxed_partial_video_path=day_dir / f"{stem}_muxed_partial.{extension}",
         final_video_path=day_dir / f"{stem}.{extension}",
         metadata_path=day_dir / f"{stem}.json",
     )

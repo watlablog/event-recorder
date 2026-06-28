@@ -3,3 +3,5 @@ opencv-python
 PyYAML
 pytest
 PyQt5
+sounddevice
+imageio-ffmpeg

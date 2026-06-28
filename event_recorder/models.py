@@ -59,5 +59,7 @@ class EventPaths:
     event_id: str
     part: int
     partial_video_path: Any
+    partial_audio_path: Any
+    muxed_partial_video_path: Any
     final_video_path: Any
     metadata_path: Any
