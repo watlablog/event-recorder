@@ -7,7 +7,7 @@ import numpy as np
 
 import event_recorder.engine as engine
 from event_recorder.config import parse_config
-from event_recorder.models import FramePacket
+from event_recorder.models import DetectedObject, DetectionResult, FramePacket
 
 
 class FakeCameraStream:
@@ -108,3 +108,141 @@ def test_recorder_engine_continues_video_when_audio_start_fails(monkeypatch):
 
     assert code == 0
     assert any("Audio disabled" in error for error in errors)
+
+
+def _detection(frame_id: int, detections: tuple[DetectedObject, ...]) -> DetectionResult:
+    return DetectionResult(
+        frame_id=frame_id,
+        captured_at_monotonic=float(frame_id),
+        detected=bool(detections),
+        detections=detections,
+    )
+
+
+def _detected(name: str, xyxy: tuple[float, float, float, float]) -> DetectedObject:
+    return DetectedObject(
+        class_id=0,
+        class_name=name,
+        confidence=0.9,
+        xyxy=xyxy,
+    )
+
+
+def test_recorder_engine_filter_runs_before_start_decision(monkeypatch):
+    config = parse_config(
+        {
+            "model": {"target_classes": ["person"]},
+            "start_confirmation": {
+                "window_results": 1,
+                "required_positive_results": 1,
+                "expire_seconds": 1_000_000_000.0,
+            },
+        }
+    )
+    stop_event = threading.Event()
+    frames: list[engine.EngineFrame] = []
+    started: list[bool] = []
+    positive = _detection(1, (_detected("person", (1.0, 1.0, 2.0, 2.0)),))
+    pending_results = [positive]
+    monkeypatch.setattr(engine, "CameraStream", FakeCameraStream)
+    monkeypatch.setattr(engine, "DetectorWorker", FakeDetectorWorker)
+    monkeypatch.setattr(
+        engine,
+        "_drain_results",
+        lambda _queue: [pending_results.pop(0)] if pending_results else [],
+    )
+    monkeypatch.setattr(
+        engine,
+        "_start_writer",
+        lambda *args, **kwargs: started.append(True),
+    )
+
+    def stop_after_frame(frame: engine.EngineFrame) -> bool:
+        frames.append(frame)
+        return True
+
+    code = engine.RecorderEngine(
+        config,
+        stop_event,
+        engine.EngineCallbacks(
+            on_frame=stop_after_frame,
+            detection_filter=lambda result: DetectionResult(
+                frame_id=result.frame_id,
+                captured_at_monotonic=result.captured_at_monotonic,
+                detected=False,
+                detections=(),
+            ),
+        ),
+    ).run()
+
+    assert code == 0
+    assert started == []
+    assert frames[0].detections == ()
+
+
+def test_recorder_engine_passes_filtered_detections_to_writer(monkeypatch):
+    config = parse_config(
+        {
+            "model": {"target_classes": ["person", "car"]},
+            "start_confirmation": {
+                "window_results": 1,
+                "required_positive_results": 1,
+                "expire_seconds": 1_000_000_000.0,
+            },
+        }
+    )
+    stop_event = threading.Event()
+    inside = _detected("person", (1.0, 1.0, 2.0, 2.0))
+    outside = _detected("car", (5.0, 5.0, 8.0, 8.0))
+    pending_results = [_detection(1, (inside, outside))]
+    starts: list[tuple[DetectedObject, ...]] = []
+
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.started_at_monotonic = 1.0
+            self.paths = type("Paths", (), {"event_id": "event"})()
+            self.observed: list[tuple[DetectedObject, ...]] = []
+            self.written: list[tuple[DetectedObject, ...]] = []
+
+        def observe_detection(self, result: DetectionResult) -> None:
+            self.observed.append(result.detections)
+
+        def write(self, packet: FramePacket, detections=()) -> None:
+            self.written.append(detections)
+
+        def close(self, *args, **kwargs) -> None:
+            pass
+
+    writer = FakeWriter()
+    monkeypatch.setattr(engine, "CameraStream", FakeCameraStream)
+    monkeypatch.setattr(engine, "DetectorWorker", FakeDetectorWorker)
+    monkeypatch.setattr(
+        engine,
+        "_drain_results",
+        lambda _queue: [pending_results.pop(0)] if pending_results else [],
+    )
+
+    def fake_start_writer(*args, **kwargs):
+        starts.append(kwargs["current_detections"])
+        return writer
+
+    monkeypatch.setattr(engine, "_start_writer", fake_start_writer)
+
+    code = engine.RecorderEngine(
+        config,
+        stop_event,
+        engine.EngineCallbacks(
+            on_frame=lambda _frame: True,
+            detection_filter=lambda result: DetectionResult(
+                frame_id=result.frame_id,
+                captured_at_monotonic=result.captured_at_monotonic,
+                detected=True,
+                detections=(outside,),
+            ),
+        ),
+    ).run()
+
+    assert code == 0
+    assert starts == [(outside,)]
+    assert writer.observed == [(outside,)]
+    assert writer.written == [(outside,)]

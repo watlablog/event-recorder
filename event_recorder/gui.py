@@ -43,6 +43,13 @@ from event_recorder.audio import MicrophoneCandidate, discover_microphones
 from event_recorder.camera_discovery import CameraCandidate, discover_cameras
 from event_recorder.config import AppConfig, ConfigError, load_config
 from event_recorder.engine import EngineCallbacks, EngineFrame, RecorderEngine
+from event_recorder.exclusion import (
+    Polygon,
+    filter_detection_result_by_exclusion,
+    map_display_point_to_frame,
+    map_display_point_to_frame_clamped,
+    nearest_polygon_vertex,
+)
 from event_recorder.logging_utils import configure_logging
 from event_recorder.model_metadata import (
     DEFAULT_TARGET_CLASSES,
@@ -55,6 +62,7 @@ from event_recorder.runtime_config import with_runtime_selection
 
 PREVIEW_BASE_STYLE = "background: #111; color: #ddd; border: 6px solid transparent;"
 PREVIEW_RECORDING_STYLE = "background: #111; color: #ddd; border: 6px solid #d71920;"
+VERTEX_PICK_RADIUS_PIXELS = 14.0
 
 
 class ModelClassesWorker(QObject):
@@ -79,18 +87,30 @@ class RecorderWorker(QObject):
     failed = pyqtSignal(str)
     finished = pyqtSignal(int)
 
-    def __init__(self, config: AppConfig, stop_event: threading.Event) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        stop_event: threading.Event,
+        exclusion_polygon: Polygon = (),
+    ) -> None:
         super().__init__()
         self.config = config
         self.stop_event = stop_event
+        self.exclusion_polygon = exclusion_polygon
 
     @pyqtSlot()
     def run(self) -> None:
         code = 2
+        detection_filter = None
+        if self.exclusion_polygon:
+            detection_filter = lambda result: filter_detection_result_by_exclusion(
+                result, self.exclusion_polygon
+            )
         callbacks = EngineCallbacks(
             on_frame=self._on_frame,
             on_status=self._on_status,
             on_error=self.failed.emit,
+            detection_filter=detection_filter,
         )
         try:
             code = RecorderEngine(self.config, self.stop_event, callbacks).run()
@@ -149,6 +169,184 @@ class ObjectsDialog(QDialog):
         return tuple(selected)
 
 
+class ExclusionPolygonCanvas(QLabel):
+    polygon_changed = pyqtSignal()
+
+    def __init__(self, frame, polygon: Polygon, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._frame = frame.copy()
+        self._polygon: list[tuple[float, float]] = list(polygon)
+        self._drag_vertex_index: int | None = None
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(800, 450)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet(PREVIEW_BASE_STYLE)
+        self.setMouseTracking(True)
+        self._refresh()
+
+    def polygon(self) -> Polygon:
+        if len(self._polygon) < 3:
+            return ()
+        return tuple(self._polygon)
+
+    def undo(self) -> None:
+        if self._polygon:
+            self._polygon.pop()
+            self._refresh()
+            self.polygon_changed.emit()
+
+    def clear(self) -> None:
+        if self._polygon:
+            self._polygon.clear()
+            self._refresh()
+            self.polygon_changed.emit()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return
+        point = self._event_frame_point(event)
+        if point is None:
+            return
+        vertex_index = nearest_polygon_vertex(
+            point,
+            tuple(self._polygon),
+            self._frame_pick_radius(),
+        )
+        if vertex_index is not None:
+            self._drag_vertex_index = vertex_index
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        self._polygon.append(point)
+        self._refresh()
+        self.polygon_changed.emit()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_vertex_index is None:
+            point = self._event_frame_point(event)
+            if point is not None and nearest_polygon_vertex(
+                point,
+                tuple(self._polygon),
+                self._frame_pick_radius(),
+            ) is not None:
+                self.setCursor(Qt.OpenHandCursor)
+            else:
+                self.unsetCursor()
+            return
+        point = self._event_frame_point(event, clamp=True)
+        if point is None:
+            return
+        self._polygon[self._drag_vertex_index] = point
+        self._refresh()
+        self.polygon_changed.emit()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self._drag_vertex_index is not None:
+            self._drag_vertex_index = None
+            self.unsetCursor()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh()
+
+    def _event_frame_point(self, event, clamp: bool = False) -> tuple[float, float] | None:
+        height, width = self._frame.shape[:2]
+        mapper = (
+            map_display_point_to_frame_clamped if clamp else map_display_point_to_frame
+        )
+        return mapper(
+            (float(event.x()), float(event.y())),
+            (self.width(), self.height()),
+            (width, height),
+        )
+
+    def _frame_pick_radius(self) -> float:
+        height, width = self._frame.shape[:2]
+        scale = min(self.width() / width, self.height() / height)
+        if scale <= 0:
+            return VERTEX_PICK_RADIUS_PIXELS
+        return VERTEX_PICK_RADIUS_PIXELS / scale
+
+    def _refresh(self) -> None:
+        try:
+            import cv2
+        except ImportError:
+            return
+
+        display = self._frame.copy()
+        if self._polygon:
+            points = _polygon_to_cv_points(self._polygon)
+            if len(points) >= 3:
+                overlay = display.copy()
+                cv2.fillPoly(overlay, [points], (0, 0, 255))
+                cv2.addWeighted(overlay, 0.22, display, 0.78, 0, display)
+            if len(points) >= 2:
+                cv2.polylines(
+                    display,
+                    [points],
+                    len(points) >= 3,
+                    (0, 0, 255),
+                    3,
+                    cv2.LINE_AA,
+                )
+            for x, y in points:
+                cv2.circle(display, (int(x), int(y)), 5, (255, 255, 255), -1)
+                cv2.circle(display, (int(x), int(y)), 5, (0, 0, 255), 2)
+
+        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        image = QImage(
+            rgb.data,
+            width,
+            height,
+            channels * width,
+            QImage.Format_RGB888,
+        ).copy()
+        self.setPixmap(
+            QPixmap.fromImage(image).scaled(
+                self.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+
+
+class ExclusionPolygonDialog(QDialog):
+    def __init__(
+        self,
+        frame,
+        polygon: Polygon,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Set Exclusion Area")
+        self._canvas = ExclusionPolygonCanvas(frame, polygon, self)
+
+        undo_button = QPushButton("Undo")
+        undo_button.clicked.connect(self._canvas.undo)
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self._canvas.clear)
+        apply_button = QPushButton("Apply")
+        apply_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(undo_button)
+        buttons.addWidget(clear_button)
+        buttons.addStretch(1)
+        buttons.addWidget(apply_button)
+        buttons.addWidget(cancel_button)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self._canvas, stretch=1)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+        self.resize(960, 620)
+
+    def polygon(self) -> Polygon:
+        return self._canvas.polygon()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
@@ -164,6 +362,7 @@ class MainWindow(QMainWindow):
         self._stop_event: threading.Event | None = None
         self._running = False
         self._last_frame: EngineFrame | None = None
+        self.exclusion_polygon: Polygon = ()
 
         self.setWindowTitle("Event Recorder")
         self._build_ui()
@@ -187,23 +386,35 @@ class MainWindow(QMainWindow):
         self.microphone_combo = QComboBox()
         self.objects_button = QPushButton("Objects to Detect")
         self.objects_button.clicked.connect(self._open_objects_dialog)
+        self.exclusion_button = QPushButton("Set Exclusion Area")
+        self.exclusion_button.clicked.connect(self._open_exclusion_dialog)
+        self.show_exclusion_checkbox = QCheckBox("Show Exclusion Area")
+        self.show_exclusion_checkbox.stateChanged.connect(
+            lambda _state: self._rerender_last_frame()
+        )
         self.rec_button = QPushButton("Rec")
         self.rec_button.clicked.connect(self._toggle_recording)
 
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Camera"))
-        controls.addWidget(self.camera_combo, stretch=1)
-        controls.addWidget(self.audio_checkbox)
-        controls.addWidget(QLabel("Microphone"))
-        controls.addWidget(self.microphone_combo, stretch=1)
-        controls.addWidget(self.objects_button)
-        controls.addWidget(self.record_boxes_checkbox)
-        controls.addWidget(self.rec_button)
+        device_controls = QHBoxLayout()
+        device_controls.addWidget(QLabel("Camera"))
+        device_controls.addWidget(self.camera_combo, stretch=1)
+        device_controls.addWidget(self.audio_checkbox)
+        device_controls.addWidget(QLabel("Microphone"))
+        device_controls.addWidget(self.microphone_combo, stretch=1)
+
+        recording_controls = QHBoxLayout()
+        recording_controls.addWidget(self.objects_button)
+        recording_controls.addWidget(self.exclusion_button)
+        recording_controls.addWidget(self.show_exclusion_checkbox)
+        recording_controls.addWidget(self.record_boxes_checkbox)
+        recording_controls.addStretch(1)
+        recording_controls.addWidget(self.rec_button)
 
         central = QWidget()
         layout = QVBoxLayout()
         layout.addWidget(self.preview_label, stretch=1)
-        layout.addLayout(controls)
+        layout.addLayout(device_controls)
+        layout.addLayout(recording_controls)
         central.setLayout(layout)
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
@@ -298,6 +509,45 @@ class MainWindow(QMainWindow):
             self.selected_classes = dialog.selected_classes()
             self._update_controls()
 
+    def _open_exclusion_dialog(self) -> None:
+        frame = self._capture_exclusion_frame()
+        if frame is None:
+            self.statusBar().showMessage("Could not capture a frame for exclusion setup")
+            return
+
+        dialog = ExclusionPolygonDialog(frame, self.exclusion_polygon, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.exclusion_polygon = dialog.polygon()
+            if not self.exclusion_polygon:
+                self.show_exclusion_checkbox.setChecked(False)
+            self._update_controls()
+            self._rerender_last_frame()
+
+    def _capture_exclusion_frame(self):
+        camera_index = self.camera_combo.currentData()
+        if camera_index is None:
+            return None
+        try:
+            import cv2
+        except ImportError:
+            self.statusBar().showMessage("opencv-python is not installed")
+            return None
+
+        capture = cv2.VideoCapture(int(camera_index))
+        try:
+            if not capture.isOpened():
+                return None
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera.width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera.height)
+            capture.set(cv2.CAP_PROP_FPS, self.config.camera.requested_fps)
+            for _ in range(8):
+                ok, frame = capture.read()
+                if ok and frame is not None and getattr(frame, "size", 0) > 0:
+                    return frame
+            return None
+        finally:
+            capture.release()
+
     def _toggle_recording(self) -> None:
         if self._running:
             self._stop_recording()
@@ -328,7 +578,11 @@ class MainWindow(QMainWindow):
         )
         self._stop_event = threading.Event()
         self._recorder_thread = QThread(self)
-        self._recorder_worker = RecorderWorker(runtime_config, self._stop_event)
+        self._recorder_worker = RecorderWorker(
+            runtime_config,
+            self._stop_event,
+            self.exclusion_polygon,
+        )
         self._recorder_worker.moveToThread(self._recorder_thread)
         self._recorder_thread.started.connect(self._recorder_worker.run)
         self._recorder_worker.frame.connect(self._on_engine_frame)
@@ -384,6 +638,8 @@ class MainWindow(QMainWindow):
             return
 
         display = frame.packet.frame.copy()
+        if self.show_exclusion_checkbox.isChecked() and self.exclusion_polygon:
+            _draw_exclusion_polygon(cv2, display, self.exclusion_polygon)
         for detected in frame.detections:
             x1, y1, x2, y2 = (int(value) for value in detected.xyxy)
             cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -414,6 +670,10 @@ class MainWindow(QMainWindow):
         )
         self.preview_label.setPixmap(pixmap)
 
+    def _rerender_last_frame(self) -> None:
+        if self._last_frame is not None:
+            self._render_frame(self._last_frame)
+
     def _update_controls(self) -> None:
         has_camera = bool(self.cameras)
         has_microphone = bool(self.microphones)
@@ -427,6 +687,8 @@ class MainWindow(QMainWindow):
             not self._running and audio_enabled and has_microphone
         )
         self.objects_button.setEnabled(not self._running and has_classes)
+        self.exclusion_button.setEnabled(not self._running and has_camera)
+        self.show_exclusion_checkbox.setEnabled(bool(self.exclusion_polygon))
         self.rec_button.setText("Stop" if self._running else "Rec")
         self.rec_button.setEnabled(
             self._running
@@ -449,6 +711,25 @@ class MainWindow(QMainWindow):
             if self._recorder_thread is not None:
                 self._recorder_thread.wait(5000)
         event.accept()
+
+
+def _polygon_to_cv_points(polygon: list[tuple[float, float]] | Polygon):
+    import numpy as np
+
+    return np.array(
+        [[int(round(x)), int(round(y))] for x, y in polygon],
+        dtype=np.int32,
+    )
+
+
+def _draw_exclusion_polygon(cv2, frame, polygon: Polygon) -> None:
+    if len(polygon) < 3:
+        return
+    points = _polygon_to_cv_points(polygon)
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [points], (0, 0, 255))
+    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+    cv2.polylines(frame, [points], True, (0, 0, 255), 3, cv2.LINE_AA)
 
 
 def _frame_status_text(frame: EngineFrame) -> str:

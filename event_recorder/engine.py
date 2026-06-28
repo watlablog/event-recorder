@@ -51,6 +51,7 @@ class EngineCallbacks:
     on_frame: Callable[[EngineFrame], bool | None] | None = None
     on_status: Callable[[RecorderStatus, str], None] | None = None
     on_error: Callable[[str], None] | None = None
+    detection_filter: Callable[[DetectionResult], DetectionResult] | None = None
 
 
 class RecorderEngine:
@@ -142,6 +143,7 @@ class RecorderEngine:
                     return failure_code
 
                 for result in _drain_results(detector_results):
+                    result = self._filter_detection(result)
                     detector_times.append(time.monotonic())
                     latest_detections = result.detections
                     start_decision = state.observe_detection(result, time.monotonic())
@@ -430,6 +432,11 @@ class RecorderEngine:
     def _error(self, message: str) -> None:
         if self.callbacks.on_error is not None:
             self.callbacks.on_error(message)
+
+    def _filter_detection(self, result: DetectionResult) -> DetectionResult:
+        if self.callbacks.detection_filter is None:
+            return result
+        return self.callbacks.detection_filter(result)
 
 
 def _start_writer(
