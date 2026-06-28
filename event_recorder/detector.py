@@ -162,7 +162,12 @@ class DetectorWorker(threading.Thread):
                 half=self.config.half,
                 verbose=False,
             )
-            result = _to_detection_result(packet, results, model.names)
+            result = _to_detection_result(
+                packet,
+                results,
+                model.names,
+                allowed_class_ids=target_class_ids,
+            )
             put_bounded_drop_oldest(self.result_queue, result)
 
 
@@ -170,6 +175,7 @@ def _to_detection_result(
     packet: FramePacket,
     results: Any,
     model_names: Mapping[int, str] | Sequence[str],
+    allowed_class_ids: Iterable[int] | None = None,
 ) -> DetectionResult:
     if not results or results[0].boxes is None or len(results[0].boxes) == 0:
         return DetectionResult(
@@ -183,11 +189,14 @@ def _to_detection_result(
     class_ids = _to_list(boxes.cls)
     confidences = _to_list(boxes.conf)
     coordinates = boxes.xyxy.tolist()
+    allowed = set(allowed_class_ids) if allowed_class_ids is not None else None
     detections: list[DetectedObject] = []
     for class_id_raw, confidence_raw, xyxy_raw in zip(
         class_ids, confidences, coordinates
     ):
         class_id = int(class_id_raw)
+        if allowed is not None and class_id not in allowed:
+            continue
         detections.append(
             DetectedObject(
                 class_id=class_id,
