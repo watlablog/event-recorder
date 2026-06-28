@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from event_recorder.audio import AudioMuxError, mux_audio_video
-from event_recorder.config import RecordingConfig
+from event_recorder.config import NightEnhancementConfig, RecordingConfig
 from event_recorder.models import (
     DetectedObject,
     DetectionResult,
@@ -28,6 +28,7 @@ class VideoClipWriter:
         source: int | str,
         model_path: str,
         target_classes: tuple[str, ...],
+        night_enhancement: NightEnhancementConfig,
         fps: float,
         frame_size: tuple[int, int],
         started_at_wall_clock: datetime,
@@ -44,6 +45,7 @@ class VideoClipWriter:
         self.source = source
         self.model_path = model_path
         self.target_classes = target_classes
+        self.night_enhancement = night_enhancement
         self.fps = fps
         self.frame_width, self.frame_height = frame_size
         self.started_at_wall_clock = started_at_wall_clock
@@ -164,6 +166,10 @@ class VideoClipWriter:
             "model_path": self.model_path,
             "target_classes": list(self.target_classes),
             "draw_boxes": self.recording.draw_boxes,
+            "night_enhancement_enabled": self.night_enhancement.enabled,
+            "night_enhancement_contrast": self.night_enhancement.contrast,
+            "night_enhancement_brightness": self.night_enhancement.brightness,
+            "night_enhancement_gamma": self.night_enhancement.gamma,
             "detected_classes": sorted(self.detected_classes),
             "max_confidence_by_class": self.max_confidence_by_class,
             "stop_reason": stop_reason.value,

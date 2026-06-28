@@ -75,6 +75,14 @@ class AudioConfig:
 
 
 @dataclass(frozen=True)
+class NightEnhancementConfig:
+    enabled: bool
+    contrast: float
+    brightness: float
+    gamma: float
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     level: str
 
@@ -88,6 +96,7 @@ class AppConfig:
     health: HealthConfig
     preview: PreviewConfig
     audio: AudioConfig
+    night_enhancement: NightEnhancementConfig
     logging: LoggingConfig
 
 
@@ -117,6 +126,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     health = _mapping(raw, "health")
     preview = _mapping(raw, "preview")
     audio = _mapping(raw, "audio")
+    night_enhancement = _mapping(raw, "night_enhancement")
     logging = _mapping(raw, "logging")
 
     config = AppConfig(
@@ -172,6 +182,12 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
             sample_rate=_int(audio, "sample_rate", 48000),
             channels=_int(audio, "channels", 1),
             fallback_to_video_only=bool(audio.get("fallback_to_video_only", True)),
+        ),
+        night_enhancement=NightEnhancementConfig(
+            enabled=bool(night_enhancement.get("enabled", False)),
+            contrast=_float(night_enhancement, "contrast", 1.35),
+            brightness=_float(night_enhancement, "brightness", 12.0),
+            gamma=_float(night_enhancement, "gamma", 1.20),
         ),
         logging=LoggingConfig(level=str(logging.get("level", "INFO"))),
     )
@@ -246,6 +262,16 @@ def validate_config(config: AppConfig) -> None:
         raise ConfigError("audio.sample_rate must be positive.")
     if config.audio.channels <= 0:
         raise ConfigError("audio.channels must be positive.")
+
+    night = config.night_enhancement
+    if not 0.5 <= night.contrast <= 3.0:
+        raise ConfigError("night_enhancement.contrast must be between 0.5 and 3.0.")
+    if not -100.0 <= night.brightness <= 100.0:
+        raise ConfigError(
+            "night_enhancement.brightness must be between -100 and 100."
+        )
+    if not 0.5 <= night.gamma <= 3.0:
+        raise ConfigError("night_enhancement.gamma must be between 0.5 and 3.0.")
 
 
 def _mapping(raw: dict[str, Any], key: str) -> dict[str, Any]:

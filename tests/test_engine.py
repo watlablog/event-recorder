@@ -49,6 +49,7 @@ class FakeDetectorWorker:
     def __init__(self, *args, **kwargs):
         self.started = False
         self.joined = False
+        self.input_queue = args[1]
         FakeDetectorWorker.last_instance = self
 
     def start(self) -> None:
@@ -108,6 +109,58 @@ def test_recorder_engine_continues_video_when_audio_start_fails(monkeypatch):
 
     assert code == 0
     assert any("Audio disabled" in error for error in errors)
+
+
+def test_recorder_engine_passes_enhanced_frame_to_detector_and_preview(monkeypatch):
+    config = parse_config(
+        {
+            "model": {"target_classes": ["person", "car"]},
+            "night_enhancement": {
+                "enabled": True,
+                "contrast": 1.0,
+                "brightness": 25,
+                "gamma": 1.0,
+            },
+        }
+    )
+    stop_event = threading.Event()
+    frames: list[engine.EngineFrame] = []
+    monkeypatch.setattr(engine, "CameraStream", FakeCameraStream)
+    monkeypatch.setattr(engine, "DetectorWorker", FakeDetectorWorker)
+
+    code = engine.RecorderEngine(
+        config,
+        stop_event,
+        engine.EngineCallbacks(on_frame=lambda frame: frames.append(frame) or True),
+    ).run()
+
+    detector = FakeDetectorWorker.last_instance
+    assert code == 0
+    assert frames
+    assert int(frames[0].packet.frame.max()) == 25
+    assert detector is not None
+    detector_packet = detector.input_queue.get_nowait()
+    assert int(detector_packet.frame.max()) == 25
+
+
+def test_recorder_engine_leaves_frame_unchanged_when_night_enhancement_disabled(
+    monkeypatch,
+):
+    config = parse_config({"model": {"target_classes": ["person", "car"]}})
+    stop_event = threading.Event()
+    frames: list[engine.EngineFrame] = []
+    monkeypatch.setattr(engine, "CameraStream", FakeCameraStream)
+    monkeypatch.setattr(engine, "DetectorWorker", FakeDetectorWorker)
+
+    code = engine.RecorderEngine(
+        config,
+        stop_event,
+        engine.EngineCallbacks(on_frame=lambda frame: frames.append(frame) or True),
+    ).run()
+
+    assert code == 0
+    assert frames
+    assert int(frames[0].packet.frame.max()) == 0
 
 
 def _detection(frame_id: int, detections: tuple[DetectedObject, ...]) -> DetectionResult:

@@ -8,9 +8,18 @@ from pathlib import Path
 import numpy as np
 
 from event_recorder.audio import AudioMuxError
-from event_recorder.config import RecordingConfig
+from event_recorder.config import NightEnhancementConfig, RecordingConfig
 from event_recorder.models import DetectedObject, EventPaths, FramePacket, StopReason
 from event_recorder.recorder import VideoClipWriter
+
+
+def _night_config(enabled: bool = False) -> NightEnhancementConfig:
+    return NightEnhancementConfig(
+        enabled=enabled,
+        contrast=1.35,
+        brightness=12.0,
+        gamma=1.20,
+    )
 
 
 class FakeVideoWriter:
@@ -84,6 +93,7 @@ def test_video_writer_falls_back_to_video_only_when_mux_fails(
         source=0,
         model_path="model.pt",
         target_classes=("person",),
+        night_enhancement=_night_config(enabled=True),
         fps=30.0,
         frame_size=(2, 2),
         started_at_wall_clock=datetime.now(timezone.utc),
@@ -109,6 +119,10 @@ def test_video_writer_falls_back_to_video_only_when_mux_fails(
     assert metadata["audio_requested"] is True
     assert metadata["audio_recorded"] is False
     assert metadata["audio_status"] == "mux_failed"
+    assert metadata["night_enhancement_enabled"] is True
+    assert metadata["night_enhancement_contrast"] == 1.35
+    assert metadata["night_enhancement_brightness"] == 12.0
+    assert metadata["night_enhancement_gamma"] == 1.20
 
 
 def test_video_writer_draws_boxes_when_enabled(monkeypatch, tmp_path):
@@ -139,6 +153,7 @@ def test_video_writer_draws_boxes_when_enabled(monkeypatch, tmp_path):
         source=0,
         model_path="model.pt",
         target_classes=("person",),
+        night_enhancement=_night_config(),
         fps=30.0,
         frame_size=(4, 4),
         started_at_wall_clock=datetime.now(timezone.utc),

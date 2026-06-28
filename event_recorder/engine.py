@@ -29,6 +29,7 @@ from event_recorder.models import (
     RecorderStatus,
     StopReason,
 )
+from event_recorder.night_enhancement import NightFrameEnhancer
 from event_recorder.prebuffer import PreEventBuffer
 from event_recorder.recorder import VideoClipWriter, VideoWriterError
 from event_recorder.storage import create_event_paths, has_minimum_free_disk
@@ -93,6 +94,7 @@ class RecorderEngine:
         part = 1
         current_event_id: str | None = None
         pending_continuation = False
+        frame_enhancer = NightFrameEnhancer(self.config.night_enhancement)
         frame_times: deque[float] = deque(maxlen=60)
         detector_times: deque[float] = deque(maxlen=30)
         packet: FramePacket | None = None
@@ -101,7 +103,7 @@ class RecorderEngine:
             self._status(RecorderStatus.WAITING, "Opening camera")
             camera.open()
             output_fps = camera.output_fps()
-            packet = camera.read_packet(1)
+            packet = frame_enhancer.apply_packet(camera.read_packet(1))
             prebuffer = PreEventBuffer(
                 output_fps=output_fps,
                 pre_event_seconds=self.config.recording.pre_event_seconds,
@@ -278,7 +280,7 @@ class RecorderEngine:
 
                 frame_id += 1
                 try:
-                    packet = camera.read_packet(frame_id)
+                    packet = frame_enhancer.apply_packet(camera.read_packet(frame_id))
                 except EndOfInput:
                     _close_clip(
                         writer,
@@ -306,7 +308,7 @@ class RecorderEngine:
                     if camera.is_file_source or not camera.reopen_with_retries():
                         self._error("Failed to read from camera.")
                         return 2
-                    packet = camera.read_packet(frame_id)
+                    packet = frame_enhancer.apply_packet(camera.read_packet(frame_id))
 
             if writer is not None:
                 _close_clip(
@@ -477,6 +479,7 @@ def _start_writer(
         source=config.camera.source,
         model_path=config.model.path,
         target_classes=config.model.target_classes,
+        night_enhancement=config.night_enhancement,
         fps=output_fps,
         frame_size=(frame_width, frame_height),
         started_at_wall_clock=started_at_packet.captured_at_wall_clock,

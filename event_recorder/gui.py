@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -25,6 +27,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -33,6 +36,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSlider,
+    QSpinBox,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -40,8 +45,15 @@ from PyQt5.QtWidgets import (
 
 from event_recorder.__main__ import default_config_path, resolve_config_path
 from event_recorder.audio import MicrophoneCandidate, discover_microphones
+from event_recorder.camera import CameraError, CameraReadError, CameraStream, EndOfInput
 from event_recorder.camera_discovery import CameraCandidate, discover_cameras
-from event_recorder.config import AppConfig, ConfigError, load_config
+from event_recorder.config import (
+    AppConfig,
+    CameraConfig,
+    ConfigError,
+    NightEnhancementConfig,
+    load_config,
+)
 from event_recorder.engine import EngineCallbacks, EngineFrame, RecorderEngine
 from event_recorder.exclusion import (
     Polygon,
@@ -57,7 +69,8 @@ from event_recorder.model_metadata import (
     default_selected_classes,
     load_model_classes,
 )
-from event_recorder.models import RecorderStatus
+from event_recorder.models import FramePacket, RecorderStatus
+from event_recorder.night_enhancement import NightFrameEnhancer
 from event_recorder.runtime_config import with_runtime_selection
 
 PREVIEW_BASE_STYLE = "background: #111; color: #ddd; border: 6px solid transparent;"
@@ -125,6 +138,74 @@ class RecorderWorker(QObject):
 
     def _on_status(self, status: RecorderStatus, message: str) -> None:
         self.status.emit(status.value, message)
+
+
+class CameraPreviewWorker(QObject):
+    frame = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, camera_config: CameraConfig, stop_event: threading.Event) -> None:
+        super().__init__()
+        self.camera_config = camera_config
+        self.stop_event = stop_event
+
+    @pyqtSlot()
+    def run(self) -> None:
+        camera = CameraStream(self.camera_config)
+        frame_id = 1
+        min_interval = 1.0 / max(1, self.camera_config.requested_fps)
+        try:
+            camera.open()
+            while not self.stop_event.is_set():
+                started_at = time.monotonic()
+                try:
+                    packet = camera.read_packet(frame_id)
+                except EndOfInput:
+                    break
+                except CameraReadError as exc:
+                    if not self.stop_event.is_set():
+                        self.failed.emit(str(exc))
+                    break
+                self.frame.emit(packet)
+                frame_id += 1
+                elapsed = time.monotonic() - started_at
+                if elapsed < min_interval:
+                    time.sleep(min_interval - elapsed)
+        except CameraError as exc:
+            if not self.stop_event.is_set():
+                self.failed.emit(str(exc))
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.failed.emit(str(exc))
+        finally:
+            camera.release()
+            self.finished.emit()
+
+
+class BlackoutWindow(QWidget):
+    escape_pressed = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__(
+            None,
+            Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint,
+        )
+        self.setStyleSheet("background: #000;")
+        self.setCursor(Qt.BlankCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self.escape_pressed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        self.activateWindow()
+        self.setFocus(Qt.MouseFocusReason)
+        event.accept()
 
 
 class ObjectsDialog(QDialog):
@@ -357,11 +438,22 @@ class MainWindow(QMainWindow):
         self.microphones: list[MicrophoneCandidate] = []
         self._model_thread: QThread | None = None
         self._model_worker: ModelClassesWorker | None = None
+        self._preview_thread: QThread | None = None
+        self._preview_worker: CameraPreviewWorker | None = None
+        self._preview_stop_event: threading.Event | None = None
+        self._active_preview_camera_index: int | None = None
+        self._pending_preview_camera_index: int | None = None
+        self._last_preview_packet: FramePacket | None = None
+        self._last_preview_camera_index: int | None = None
+        self._preview_night_key: tuple[bool, float, float, float] | None = None
+        self._preview_night_enhancer: NightFrameEnhancer | None = None
+        self._blackout_windows: list[BlackoutWindow] = []
         self._recorder_thread: QThread | None = None
         self._recorder_worker: RecorderWorker | None = None
         self._stop_event: threading.Event | None = None
         self._running = False
         self._last_frame: EngineFrame | None = None
+        self._refreshing_cameras = False
         self.exclusion_polygon: Polygon = ()
 
         self.setWindowTitle("Event Recorder")
@@ -378,11 +470,42 @@ class MainWindow(QMainWindow):
         self.preview_label.setStyleSheet(PREVIEW_BASE_STYLE)
 
         self.camera_combo = QComboBox()
+        self.camera_combo.currentIndexChanged.connect(lambda _index: self._on_camera_changed())
         self.audio_checkbox = QCheckBox("Enable Audio")
         self.audio_checkbox.setChecked(self.config.audio.enabled)
         self.audio_checkbox.stateChanged.connect(lambda _state: self._update_controls())
         self.record_boxes_checkbox = QCheckBox("Record Boxes")
         self.record_boxes_checkbox.setChecked(self.config.recording.draw_boxes)
+        self.night_checkbox = QCheckBox("Night Mode")
+        self.night_checkbox.setChecked(self.config.night_enhancement.enabled)
+        self.night_checkbox.stateChanged.connect(lambda _state: self._on_night_changed())
+        self.contrast_slider, self.contrast_spin = _double_slider_spin(
+            0.50,
+            3.00,
+            0.05,
+            self.config.night_enhancement.contrast,
+        )
+        self.brightness_slider, self.brightness_spin = _int_slider_spin(
+            -100,
+            100,
+            int(round(self.config.night_enhancement.brightness)),
+        )
+        self.gamma_slider, self.gamma_spin = _double_slider_spin(
+            0.50,
+            3.00,
+            0.05,
+            self.config.night_enhancement.gamma,
+        )
+        for widget in (
+            self.contrast_slider,
+            self.contrast_spin,
+            self.brightness_slider,
+            self.brightness_spin,
+            self.gamma_slider,
+            self.gamma_spin,
+        ):
+            if hasattr(widget, "valueChanged"):
+                widget.valueChanged.connect(lambda _value: self._on_night_changed())
         self.microphone_combo = QComboBox()
         self.objects_button = QPushButton("Objects to Detect")
         self.objects_button.clicked.connect(self._open_objects_dialog)
@@ -392,6 +515,8 @@ class MainWindow(QMainWindow):
         self.show_exclusion_checkbox.stateChanged.connect(
             lambda _state: self._rerender_last_frame()
         )
+        self.blackout_button = QPushButton("Blackout")
+        self.blackout_button.clicked.connect(self._show_blackout)
         self.rec_button = QPushButton("Rec")
         self.rec_button.clicked.connect(self._toggle_recording)
 
@@ -408,12 +533,26 @@ class MainWindow(QMainWindow):
         recording_controls.addWidget(self.show_exclusion_checkbox)
         recording_controls.addWidget(self.record_boxes_checkbox)
         recording_controls.addStretch(1)
+        recording_controls.addWidget(self.blackout_button)
         recording_controls.addWidget(self.rec_button)
+
+        night_controls = QHBoxLayout()
+        night_controls.addWidget(self.night_checkbox)
+        night_controls.addWidget(QLabel("Contrast"))
+        night_controls.addWidget(self.contrast_slider, stretch=1)
+        night_controls.addWidget(self.contrast_spin)
+        night_controls.addWidget(QLabel("Brightness"))
+        night_controls.addWidget(self.brightness_slider, stretch=1)
+        night_controls.addWidget(self.brightness_spin)
+        night_controls.addWidget(QLabel("Gamma"))
+        night_controls.addWidget(self.gamma_slider, stretch=1)
+        night_controls.addWidget(self.gamma_spin)
 
         central = QWidget()
         layout = QVBoxLayout()
         layout.addWidget(self.preview_label, stretch=1)
         layout.addLayout(device_controls)
+        layout.addLayout(night_controls)
         layout.addLayout(recording_controls)
         central.setLayout(layout)
         self.setCentralWidget(central)
@@ -428,14 +567,17 @@ class MainWindow(QMainWindow):
         self._discover_cameras()
         self._discover_microphones()
         self._update_controls()
+        self._restart_idle_preview()
 
     def _discover_cameras(self) -> None:
         self.statusBar().showMessage("Scanning cameras")
+        self._refreshing_cameras = True
         self.camera_combo.clear()
         try:
             self.cameras = discover_cameras()
         except Exception as exc:
             self.cameras = []
+            self._refreshing_cameras = False
             self.statusBar().showMessage(f"Camera scan failed: {exc}")
             self._update_controls()
             return
@@ -447,7 +589,150 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("No camera found")
         else:
             self.statusBar().showMessage("Loading model classes")
+        self._refreshing_cameras = False
         self._update_controls()
+
+    def _on_camera_changed(self) -> None:
+        if self._refreshing_cameras or self._running:
+            return
+        self._restart_idle_preview()
+
+    def _restart_idle_preview(self) -> None:
+        if self._running:
+            return
+        camera_index = self.camera_combo.currentData()
+        if camera_index is None:
+            self._pending_preview_camera_index = None
+            self._stop_idle_preview(wait=False)
+            return
+
+        self._pending_preview_camera_index = int(camera_index)
+        if self._preview_thread is not None and self._preview_thread.isRunning():
+            self._stop_idle_preview(wait=False)
+            return
+        self._start_pending_idle_preview()
+
+    def _start_pending_idle_preview(self) -> None:
+        if self._running or self._pending_preview_camera_index is None:
+            return
+        camera_index = self._pending_preview_camera_index
+        self._pending_preview_camera_index = None
+        self._start_idle_preview(camera_index)
+
+    def _start_idle_preview(self, camera_index: int) -> None:
+        self._stop_idle_preview(wait=True)
+        if self._preview_thread is not None:
+            return
+
+        camera_config = replace(self.config.camera, source=camera_index)
+        self._preview_stop_event = threading.Event()
+        self._active_preview_camera_index = camera_index
+        self._preview_thread = QThread(self)
+        self._preview_worker = CameraPreviewWorker(
+            camera_config,
+            self._preview_stop_event,
+        )
+        self._preview_worker.moveToThread(self._preview_thread)
+        self._preview_thread.started.connect(self._preview_worker.run)
+        self._preview_worker.frame.connect(self._on_preview_packet)
+        self._preview_worker.failed.connect(self._on_preview_error)
+        self._preview_worker.finished.connect(self._on_preview_finished)
+        self._preview_worker.finished.connect(self._preview_thread.quit)
+        self._preview_worker.finished.connect(self._preview_worker.deleteLater)
+        self._preview_thread.finished.connect(self._preview_thread.deleteLater)
+        self.statusBar().showMessage(f"Previewing Camera {camera_index}")
+        self._preview_thread.start()
+
+    def _stop_idle_preview(self, wait: bool) -> bool:
+        if self._preview_stop_event is not None:
+            self._preview_stop_event.set()
+        thread = self._preview_thread
+        if thread is None:
+            return True
+        if not wait:
+            return False
+        deadline = time.monotonic() + 2.0
+        while thread.isRunning() and time.monotonic() < deadline:
+            thread.wait(50)
+            QApplication.processEvents()
+        stopped = not thread.isRunning()
+        if stopped and self._preview_thread is thread:
+            self._preview_worker = None
+            self._preview_thread = None
+            self._preview_stop_event = None
+            self._active_preview_camera_index = None
+        return stopped
+
+    def _on_preview_packet(self, packet: object) -> None:
+        if self._running:
+            return
+        if not isinstance(packet, FramePacket):
+            return
+        self._last_preview_packet = packet
+        self._last_preview_camera_index = self._active_preview_camera_index
+        self._set_preview_recording(False)
+        self._render_packet(self._enhance_idle_preview_packet(packet), ())
+
+    def _on_preview_error(self, message: str) -> None:
+        if not self._running:
+            self.statusBar().showMessage(f"Preview error: {message}")
+
+    def _on_preview_finished(self) -> None:
+        self._preview_worker = None
+        self._preview_thread = None
+        self._preview_stop_event = None
+        self._active_preview_camera_index = None
+        if self._pending_preview_camera_index is not None and not self._running:
+            self._start_pending_idle_preview()
+
+    def _on_night_changed(self) -> None:
+        self._preview_night_key = None
+        self._update_controls()
+        self._rerender_last_frame()
+
+    def _show_blackout(self) -> None:
+        if self._blackout_windows:
+            return
+        screens = QApplication.screens() or [self.screen()]
+        for screen in screens:
+            window = BlackoutWindow()
+            window.escape_pressed.connect(self._hide_blackout)
+            if screen is not None:
+                window.setGeometry(screen.geometry())
+            self._blackout_windows.append(window)
+            window.showFullScreen()
+        if self._blackout_windows:
+            self._blackout_windows[0].raise_()
+            self._blackout_windows[0].activateWindow()
+            self._blackout_windows[0].setFocus(Qt.ActiveWindowFocusReason)
+        self.blackout_button.setEnabled(False)
+
+    def _hide_blackout(self) -> None:
+        windows = self._blackout_windows
+        self._blackout_windows = []
+        for window in windows:
+            window.close()
+            window.deleteLater()
+        self.blackout_button.setEnabled(True)
+
+    def _current_night_config(self) -> NightEnhancementConfig:
+        return NightEnhancementConfig(
+            enabled=self.night_checkbox.isChecked(),
+            contrast=self.contrast_spin.value(),
+            brightness=float(self.brightness_spin.value()),
+            gamma=self.gamma_spin.value(),
+        )
+
+    def _current_preview_enhancer(self) -> NightFrameEnhancer:
+        config = self._current_night_config()
+        key = (config.enabled, config.contrast, config.brightness, config.gamma)
+        if key != self._preview_night_key or self._preview_night_enhancer is None:
+            self._preview_night_key = key
+            self._preview_night_enhancer = NightFrameEnhancer(config)
+        return self._preview_night_enhancer
+
+    def _enhance_idle_preview_packet(self, packet: FramePacket) -> FramePacket:
+        return self._current_preview_enhancer().apply_packet(packet)
 
     def _discover_microphones(self) -> None:
         self.microphone_combo.clear()
@@ -525,12 +810,27 @@ class MainWindow(QMainWindow):
 
     def _capture_exclusion_frame(self):
         camera_index = self.camera_combo.currentData()
+        if (
+            self._last_preview_packet is not None
+            and self._last_preview_camera_index == camera_index
+            and not self._running
+        ):
+            return (
+                self._enhance_idle_preview_packet(self._last_preview_packet)
+                .frame.copy()
+            )
         if camera_index is None:
             return None
+        restart_preview = not self._running and self._preview_thread is not None
+        if restart_preview:
+            self._pending_preview_camera_index = None
+            self._stop_idle_preview(wait=True)
         try:
             import cv2
         except ImportError:
             self.statusBar().showMessage("opencv-python is not installed")
+            if restart_preview:
+                self._restart_idle_preview()
             return None
 
         capture = cv2.VideoCapture(int(camera_index))
@@ -547,6 +847,8 @@ class MainWindow(QMainWindow):
             return None
         finally:
             capture.release()
+            if restart_preview:
+                self._restart_idle_preview()
 
     def _toggle_recording(self) -> None:
         if self._running:
@@ -568,6 +870,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Select a microphone or disable audio")
             return
 
+        self._pending_preview_camera_index = None
+        if not self._stop_idle_preview(wait=True):
+            self.statusBar().showMessage("Stopping preview")
+            return
+
         runtime_config = with_runtime_selection(
             self.config,
             camera_source=int(camera_index),
@@ -575,6 +882,10 @@ class MainWindow(QMainWindow):
             audio_enabled=audio_enabled,
             audio_device=audio_device,
             recording_draw_boxes=self.record_boxes_checkbox.isChecked(),
+            night_enhancement_enabled=self.night_checkbox.isChecked(),
+            night_enhancement_contrast=self.contrast_spin.value(),
+            night_enhancement_brightness=float(self.brightness_spin.value()),
+            night_enhancement_gamma=self.gamma_spin.value(),
         )
         self._stop_event = threading.Event()
         self._recorder_thread = QThread(self)
@@ -630,17 +941,25 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Error")
         self._update_controls()
+        self._restart_idle_preview()
 
     def _render_frame(self, frame: EngineFrame) -> None:
+        self._render_packet(frame.packet, frame.detections)
+
+    def _render_packet(
+        self,
+        packet: FramePacket,
+        detections: tuple = (),
+    ) -> None:
         try:
             import cv2
         except ImportError:
             return
 
-        display = frame.packet.frame.copy()
+        display = packet.frame.copy()
         if self.show_exclusion_checkbox.isChecked() and self.exclusion_polygon:
             _draw_exclusion_polygon(cv2, display, self.exclusion_polygon)
-        for detected in frame.detections:
+        for detected in detections:
             x1, y1, x2, y2 = (int(value) for value in detected.xyxy)
             cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(
@@ -671,8 +990,13 @@ class MainWindow(QMainWindow):
         self.preview_label.setPixmap(pixmap)
 
     def _rerender_last_frame(self) -> None:
-        if self._last_frame is not None:
+        if self._running and self._last_frame is not None:
             self._render_frame(self._last_frame)
+        elif self._last_preview_packet is not None:
+            self._render_packet(
+                self._enhance_idle_preview_packet(self._last_preview_packet),
+                (),
+            )
 
     def _update_controls(self) -> None:
         has_camera = bool(self.cameras)
@@ -683,12 +1007,24 @@ class MainWindow(QMainWindow):
         self.camera_combo.setEnabled(not self._running and has_camera)
         self.audio_checkbox.setEnabled(not self._running)
         self.record_boxes_checkbox.setEnabled(not self._running)
+        self.night_checkbox.setEnabled(not self._running)
+        night_enabled = self.night_checkbox.isChecked()
+        for widget in (
+            self.contrast_slider,
+            self.contrast_spin,
+            self.brightness_slider,
+            self.brightness_spin,
+            self.gamma_slider,
+            self.gamma_spin,
+        ):
+            widget.setEnabled(not self._running and night_enabled)
         self.microphone_combo.setEnabled(
             not self._running and audio_enabled and has_microphone
         )
         self.objects_button.setEnabled(not self._running and has_classes)
         self.exclusion_button.setEnabled(not self._running and has_camera)
         self.show_exclusion_checkbox.setEnabled(bool(self.exclusion_polygon))
+        self.blackout_button.setEnabled(not self._blackout_windows)
         self.rec_button.setText("Stop" if self._running else "Rec")
         self.rec_button.setEnabled(
             self._running
@@ -710,6 +1046,8 @@ class MainWindow(QMainWindow):
             self._stop_event.set()
             if self._recorder_thread is not None:
                 self._recorder_thread.wait(5000)
+        self._hide_blackout()
+        self._stop_idle_preview(wait=True)
         event.accept()
 
 
@@ -730,6 +1068,69 @@ def _draw_exclusion_polygon(cv2, frame, polygon: Polygon) -> None:
     cv2.fillPoly(overlay, [points], (0, 0, 255))
     cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
     cv2.polylines(frame, [points], True, (0, 0, 255), 3, cv2.LINE_AA)
+
+
+def _double_slider_spin(
+    minimum: float,
+    maximum: float,
+    step: float,
+    value: float,
+) -> tuple[QSlider, QDoubleSpinBox]:
+    factor = int(round(1.0 / step))
+    slider = QSlider(Qt.Horizontal)
+    slider.setRange(int(round(minimum * factor)), int(round(maximum * factor)))
+    slider.setSingleStep(1)
+    slider.setValue(int(round(value * factor)))
+
+    spin = QDoubleSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setSingleStep(step)
+    spin.setDecimals(2)
+    spin.setValue(value)
+
+    def slider_changed(raw_value: int) -> None:
+        spin.blockSignals(True)
+        spin.setValue(raw_value / factor)
+        spin.blockSignals(False)
+
+    def spin_changed(raw_value: float) -> None:
+        slider.blockSignals(True)
+        slider.setValue(int(round(raw_value * factor)))
+        slider.blockSignals(False)
+
+    slider.valueChanged.connect(slider_changed)
+    spin.valueChanged.connect(spin_changed)
+    return slider, spin
+
+
+def _int_slider_spin(
+    minimum: int,
+    maximum: int,
+    value: int,
+) -> tuple[QSlider, QSpinBox]:
+    slider = QSlider(Qt.Horizontal)
+    slider.setRange(minimum, maximum)
+    slider.setSingleStep(1)
+    slider.setValue(value)
+
+    spin = QSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setSingleStep(1)
+    spin.setValue(value)
+
+    def slider_changed(raw_value: int) -> None:
+        spin.blockSignals(True)
+        spin.setValue(raw_value)
+        spin.blockSignals(False)
+
+    def spin_changed(raw_value: int) -> None:
+        slider.blockSignals(True)
+        slider.setValue(raw_value)
+        slider.blockSignals(False)
+
+    slider.valueChanged.connect(slider_changed)
+    spin.valueChanged.connect(spin_changed)
+    return slider, spin
 
 
 def _frame_status_text(frame: EngineFrame) -> str:
