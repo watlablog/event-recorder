@@ -5,6 +5,17 @@ import sys
 import threading
 from pathlib import Path
 
+
+def _preload_model_runtime() -> None:
+    try:
+        import torch  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(f"PyTorch failed to initialize: {exc}") from exc
+
+
+# Load PyTorch before PyQt so Windows resolves PyTorch's DLL dependencies first.
+_preload_model_runtime()
+
 from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
@@ -171,6 +182,8 @@ class MainWindow(QMainWindow):
         self.audio_checkbox = QCheckBox("Enable Audio")
         self.audio_checkbox.setChecked(self.config.audio.enabled)
         self.audio_checkbox.stateChanged.connect(lambda _state: self._update_controls())
+        self.record_boxes_checkbox = QCheckBox("Record Boxes")
+        self.record_boxes_checkbox.setChecked(self.config.recording.draw_boxes)
         self.microphone_combo = QComboBox()
         self.objects_button = QPushButton("Objects to Detect")
         self.objects_button.clicked.connect(self._open_objects_dialog)
@@ -184,6 +197,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("Microphone"))
         controls.addWidget(self.microphone_combo, stretch=1)
         controls.addWidget(self.objects_button)
+        controls.addWidget(self.record_boxes_checkbox)
         controls.addWidget(self.rec_button)
 
         central = QWidget()
@@ -310,6 +324,7 @@ class MainWindow(QMainWindow):
             target_classes=self.selected_classes,
             audio_enabled=audio_enabled,
             audio_device=audio_device,
+            recording_draw_boxes=self.record_boxes_checkbox.isChecked(),
         )
         self._stop_event = threading.Event()
         self._recorder_thread = QThread(self)
@@ -407,6 +422,7 @@ class MainWindow(QMainWindow):
         audio_enabled = self.audio_checkbox.isChecked()
         self.camera_combo.setEnabled(not self._running and has_camera)
         self.audio_checkbox.setEnabled(not self._running)
+        self.record_boxes_checkbox.setEnabled(not self._running)
         self.microphone_combo.setEnabled(
             not self._running and audio_enabled and has_microphone
         )
@@ -477,6 +493,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     configure_logging(config.logging.level)
+    try:
+        _preload_model_runtime()
+    except RuntimeError as exc:
+        QMessageBox.critical(None, "Model Runtime Error", str(exc))
+        return 2
+
     window = MainWindow(config)
     window.resize(1024, 680)
     window.show()

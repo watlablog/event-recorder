@@ -5,21 +5,26 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 from event_recorder.audio import AudioMuxError
 from event_recorder.config import RecordingConfig
-from event_recorder.models import EventPaths, StopReason
+from event_recorder.models import DetectedObject, EventPaths, FramePacket, StopReason
 from event_recorder.recorder import VideoClipWriter
 
 
 class FakeVideoWriter:
+    written_frames = []
+
     def __init__(self, *args, **kwargs):
         self.released = False
+        FakeVideoWriter.written_frames = []
 
     def isOpened(self) -> bool:
         return True
 
     def write(self, frame) -> None:
-        pass
+        FakeVideoWriter.written_frames.append(frame.copy())
 
     def release(self) -> None:
         self.released = True
@@ -27,10 +32,22 @@ class FakeVideoWriter:
 
 class FakeCv2:
     VideoWriter = FakeVideoWriter
+    FONT_HERSHEY_SIMPLEX = 0
+    LINE_AA = 0
+    rectangle_calls = []
 
     @staticmethod
     def VideoWriter_fourcc(*args):
         return 0
+
+    @staticmethod
+    def rectangle(frame, pt1, pt2, color, thickness):
+        FakeCv2.rectangle_calls.append((pt1, pt2, color, thickness))
+        frame[:, :, 1] = 255
+
+    @staticmethod
+    def putText(*args, **kwargs):
+        pass
 
 
 def test_video_writer_falls_back_to_video_only_when_mux_fails(
@@ -92,3 +109,59 @@ def test_video_writer_falls_back_to_video_only_when_mux_fails(
     assert metadata["audio_requested"] is True
     assert metadata["audio_recorded"] is False
     assert metadata["audio_status"] == "mux_failed"
+
+
+def test_video_writer_draws_boxes_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "cv2", FakeCv2)
+    FakeCv2.rectangle_calls = []
+    paths = EventPaths(
+        event_id="event",
+        part=1,
+        partial_video_path=tmp_path / "event_partial.mp4",
+        partial_audio_path=tmp_path / "event_partial.wav",
+        muxed_partial_video_path=tmp_path / "event_muxed_partial.mp4",
+        final_video_path=tmp_path / "event.mp4",
+        metadata_path=tmp_path / "event.json",
+    )
+    writer = VideoClipWriter(
+        paths=paths,
+        recording=RecordingConfig(
+            output_directory=tmp_path,
+            extension="mp4",
+            fourcc="mp4v",
+            pre_event_seconds=1.0,
+            post_event_seconds=3.0,
+            max_clip_seconds=600,
+            max_prebuffer_mb=256,
+            minimum_free_disk_gb=0,
+            draw_boxes=True,
+        ),
+        source=0,
+        model_path="model.pt",
+        target_classes=("person",),
+        fps=30.0,
+        frame_size=(4, 4),
+        started_at_wall_clock=datetime.now(timezone.utc),
+        started_at_monotonic=1.0,
+    )
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    writer.write(
+        FramePacket(
+            frame_id=1,
+            captured_at_monotonic=1.0,
+            captured_at_wall_clock=datetime.now(timezone.utc),
+            frame=frame,
+        ),
+        (
+            DetectedObject(
+                class_id=0,
+                class_name="person",
+                confidence=0.9,
+                xyxy=(0.0, 0.0, 3.0, 3.0),
+            ),
+        ),
+    )
+
+    assert FakeCv2.rectangle_calls
+    assert FakeVideoWriter.written_frames[0][:, :, 1].max() == 255
+    assert frame[:, :, 1].max() == 0

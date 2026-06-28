@@ -35,6 +35,10 @@ GUI mode is available separately:
 ./venv/bin/python smart_recorder_gui.py
 ```
 
+In GUI mode, enable `Record Boxes` to burn YOLO bounding boxes and labels into
+the saved video clips. The same behavior can be enabled for CLI runs with
+`recording.draw_boxes: true` in `config.yaml`.
+
 In GUI mode, enable `Enable Audio` and choose a microphone to mux microphone
 audio into finalized clips. If audio capture or muxing fails, the app keeps the
 video-only MP4 and records the audio status in the JSON metadata.

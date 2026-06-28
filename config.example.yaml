@@ -33,6 +33,7 @@ recording:
   max_clip_seconds: 600
   max_prebuffer_mb: 256
   minimum_free_disk_gb: 2.0
+  draw_boxes: false
 
 health:
   detector_stale_seconds: 5.0

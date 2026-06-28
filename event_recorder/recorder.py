@@ -6,7 +6,13 @@ from typing import Any
 
 from event_recorder.audio import AudioMuxError, mux_audio_video
 from event_recorder.config import RecordingConfig
-from event_recorder.models import DetectionResult, EventPaths, FramePacket, StopReason
+from event_recorder.models import (
+    DetectedObject,
+    DetectionResult,
+    EventPaths,
+    FramePacket,
+    StopReason,
+)
 from event_recorder.storage import write_metadata
 
 
@@ -32,6 +38,7 @@ class VideoClipWriter:
         except ImportError as exc:
             raise VideoWriterError("opencv-python is not installed.") from exc
 
+        self._cv2 = cv2
         self.paths = paths
         self.recording = recording
         self.source = source
@@ -57,13 +64,20 @@ class VideoClipWriter:
             _unlink_if_exists(paths.partial_video_path)
             raise VideoWriterError(f"Could not open VideoWriter: {paths.partial_video_path}")
 
-    def write(self, packet: FramePacket) -> None:
+    def write(
+        self,
+        packet: FramePacket,
+        detections: tuple[DetectedObject, ...] = (),
+    ) -> None:
         if (
             self.last_written_frame_id is not None
             and packet.frame_id <= self.last_written_frame_id
         ):
             return
-        self._writer.write(packet.frame)
+        frame = packet.frame
+        if self.recording.draw_boxes and detections:
+            frame = _draw_detections(self._cv2, frame, detections)
+        self._writer.write(frame)
         self.frame_count += 1
         self.last_written_frame_id = packet.frame_id
 
@@ -149,6 +163,7 @@ class VideoClipWriter:
             "frame_height": self.frame_height,
             "model_path": self.model_path,
             "target_classes": list(self.target_classes),
+            "draw_boxes": self.recording.draw_boxes,
             "detected_classes": sorted(self.detected_classes),
             "max_confidence_by_class": self.max_confidence_by_class,
             "stop_reason": stop_reason.value,
@@ -159,6 +174,24 @@ class VideoClipWriter:
             "audio_sample_rate": audio_sample_rate,
             "audio_channels": audio_channels,
         }
+
+
+def _draw_detections(cv2, frame, detections: tuple[DetectedObject, ...]):
+    display = frame.copy()
+    for detected in detections:
+        x1, y1, x2, y2 = (int(value) for value in detected.xyxy)
+        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            display,
+            f"{detected.class_name} {detected.confidence:.2f}",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    return display
 
 
 def _unlink_if_exists(path: Path) -> None:

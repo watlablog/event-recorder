@@ -1,5 +1,6 @@
 yolo_event_recorder_spec.md
 config.yaml
+.venv/
 venv/
 recordings/
 *.pt

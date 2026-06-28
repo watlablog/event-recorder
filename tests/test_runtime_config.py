@@ -36,3 +36,28 @@ def test_runtime_config_replaces_audio_selection():
     assert updated.audio.device == 4
     assert config.audio.enabled is False
     assert config.audio.device is None
+
+
+def test_runtime_config_replaces_recording_draw_boxes():
+    config = parse_config({"model": {"target_classes": ["person", "car"]}})
+
+    updated = with_runtime_selection(
+        config,
+        camera_source=1,
+        target_classes=("person",),
+        recording_draw_boxes=True,
+    )
+
+    assert updated.recording.draw_boxes is True
+    assert config.recording.draw_boxes is False
+
+
+def test_config_parses_recording_draw_boxes():
+    config = parse_config(
+        {
+            "model": {"target_classes": ["person", "car"]},
+            "recording": {"draw_boxes": True},
+        }
+    )
+
+    assert config.recording.draw_boxes is True

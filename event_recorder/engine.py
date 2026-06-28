@@ -156,6 +156,7 @@ class RecorderEngine:
                         writer = _start_writer(
                             config=self.config,
                             packet=packet,
+                            current_detections=latest_detections,
                             output_fps=output_fps,
                             event_start_monotonic=event_start_monotonic,
                             event_id=None,
@@ -193,6 +194,7 @@ class RecorderEngine:
                     writer = _start_writer(
                         config=self.config,
                         packet=packet,
+                        current_detections=latest_detections,
                         output_fps=output_fps,
                         event_start_monotonic=packet.captured_at_monotonic,
                         event_id=current_event_id,
@@ -210,7 +212,7 @@ class RecorderEngine:
                     self._status(RecorderStatus.RECORDING, "Recording next clip part")
 
                 if writer is not None:
-                    writer.write(packet)
+                    writer.write(packet, latest_detections)
                     split_decision = state.max_clip_stop_decision(
                         packet.captured_at_monotonic
                     )
@@ -433,6 +435,7 @@ class RecorderEngine:
 def _start_writer(
     config: AppConfig,
     packet: FramePacket,
+    current_detections: tuple[DetectedObject, ...],
     output_fps: float,
     event_start_monotonic: float,
     event_id: str | None,
@@ -473,7 +476,8 @@ def _start_writer(
         started_at_monotonic=event_start_monotonic,
     )
     for buffered in buffered_frames:
-        writer.write(buffered)
+        detections = current_detections if buffered.frame_id == packet.frame_id else ()
+        writer.write(buffered, detections)
     return writer
 
 

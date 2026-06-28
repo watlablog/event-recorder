@@ -49,6 +49,7 @@ class RecordingConfig:
     max_clip_seconds: float
     max_prebuffer_mb: int
     minimum_free_disk_gb: float
+    draw_boxes: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
             max_clip_seconds=_float(recording, "max_clip_seconds", 600),
             max_prebuffer_mb=_int(recording, "max_prebuffer_mb", 256),
             minimum_free_disk_gb=_float(recording, "minimum_free_disk_gb", 2.0),
+            draw_boxes=bool(recording.get("draw_boxes", False)),
         ),
         health=HealthConfig(
             detector_stale_seconds=_float(health, "detector_stale_seconds", 5.0),
