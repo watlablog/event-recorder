@@ -12,6 +12,7 @@ def with_runtime_selection(
     audio_enabled: bool | None = None,
     audio_device: int | str | None = None,
     recording_draw_boxes: bool | None = None,
+    recording_draw_timestamp: bool | None = None,
     night_enhancement_enabled: bool | None = None,
     night_enhancement_contrast: float | None = None,
     night_enhancement_brightness: float | None = None,
@@ -26,6 +27,8 @@ def with_runtime_selection(
     recording = config.recording
     if recording_draw_boxes is not None:
         recording = replace(recording, draw_boxes=recording_draw_boxes)
+    if recording_draw_timestamp is not None:
+        recording = replace(recording, draw_timestamp=recording_draw_timestamp)
 
     night_enhancement = config.night_enhancement
     if night_enhancement_enabled is not None:

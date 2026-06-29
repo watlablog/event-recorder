@@ -476,6 +476,8 @@ class MainWindow(QMainWindow):
         self.audio_checkbox.stateChanged.connect(lambda _state: self._update_controls())
         self.record_boxes_checkbox = QCheckBox("Record Boxes")
         self.record_boxes_checkbox.setChecked(self.config.recording.draw_boxes)
+        self.timestamp_checkbox = QCheckBox("Timestamp")
+        self.timestamp_checkbox.setChecked(self.config.recording.draw_timestamp)
         self.night_checkbox = QCheckBox("Night Mode")
         self.night_checkbox.setChecked(self.config.night_enhancement.enabled)
         self.night_checkbox.stateChanged.connect(lambda _state: self._on_night_changed())
@@ -532,6 +534,7 @@ class MainWindow(QMainWindow):
         recording_controls.addWidget(self.exclusion_button)
         recording_controls.addWidget(self.show_exclusion_checkbox)
         recording_controls.addWidget(self.record_boxes_checkbox)
+        recording_controls.addWidget(self.timestamp_checkbox)
         recording_controls.addStretch(1)
         recording_controls.addWidget(self.blackout_button)
         recording_controls.addWidget(self.rec_button)
@@ -882,6 +885,7 @@ class MainWindow(QMainWindow):
             audio_enabled=audio_enabled,
             audio_device=audio_device,
             recording_draw_boxes=self.record_boxes_checkbox.isChecked(),
+            recording_draw_timestamp=self.timestamp_checkbox.isChecked(),
             night_enhancement_enabled=self.night_checkbox.isChecked(),
             night_enhancement_contrast=self.contrast_spin.value(),
             night_enhancement_brightness=float(self.brightness_spin.value()),
@@ -1007,6 +1011,7 @@ class MainWindow(QMainWindow):
         self.camera_combo.setEnabled(not self._running and has_camera)
         self.audio_checkbox.setEnabled(not self._running)
         self.record_boxes_checkbox.setEnabled(not self._running)
+        self.timestamp_checkbox.setEnabled(not self._running)
         self.night_checkbox.setEnabled(not self._running)
         night_enabled = self.night_checkbox.isChecked()
         for widget in (

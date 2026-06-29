@@ -77,8 +77,17 @@ class VideoClipWriter:
         ):
             return
         frame = packet.frame
-        if self.recording.draw_boxes and detections:
-            frame = _draw_detections(self._cv2, frame, detections)
+        if (
+            (self.recording.draw_boxes and detections)
+            or self.recording.draw_timestamp
+        ):
+            frame = _draw_recording_overlays(
+                self._cv2,
+                frame,
+                detections if self.recording.draw_boxes else (),
+                packet.captured_at_wall_clock,
+                draw_timestamp=self.recording.draw_timestamp,
+            )
         self._writer.write(frame)
         self.frame_count += 1
         self.last_written_frame_id = packet.frame_id
@@ -166,6 +175,7 @@ class VideoClipWriter:
             "model_path": self.model_path,
             "target_classes": list(self.target_classes),
             "draw_boxes": self.recording.draw_boxes,
+            "draw_timestamp": self.recording.draw_timestamp,
             "night_enhancement_enabled": self.night_enhancement.enabled,
             "night_enhancement_contrast": self.night_enhancement.contrast,
             "night_enhancement_brightness": self.night_enhancement.brightness,
@@ -182,7 +192,13 @@ class VideoClipWriter:
         }
 
 
-def _draw_detections(cv2, frame, detections: tuple[DetectedObject, ...]):
+def _draw_recording_overlays(
+    cv2,
+    frame,
+    detections: tuple[DetectedObject, ...],
+    captured_at: datetime,
+    draw_timestamp: bool,
+):
     display = frame.copy()
     for detected in detections:
         x1, y1, x2, y2 = (int(value) for value in detected.xyxy)
@@ -197,7 +213,47 @@ def _draw_detections(cv2, frame, detections: tuple[DetectedObject, ...]):
             2,
             cv2.LINE_AA,
         )
+    if draw_timestamp:
+        _draw_timestamp(cv2, display, captured_at)
     return display
+
+
+def _draw_timestamp(cv2, frame, captured_at: datetime) -> None:
+    label = captured_at.strftime("%Y-%m-%d %H:%M:%S")
+    height, width = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.6, min(width, height) / 900.0)
+    text_thickness = max(1, int(round(scale * 2)))
+    outline_thickness = text_thickness + 3
+    margin = max(12, int(round(scale * 18)))
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label,
+        font,
+        scale,
+        text_thickness,
+    )
+    x = max(margin, width - text_width - margin)
+    y = max(margin + text_height, margin + text_height + baseline)
+    cv2.putText(
+        frame,
+        label,
+        (x, y),
+        font,
+        scale,
+        (0, 0, 0),
+        outline_thickness,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        label,
+        (x, y),
+        font,
+        scale,
+        (255, 255, 255),
+        text_thickness,
+        cv2.LINE_AA,
+    )
 
 
 def _unlink_if_exists(path: Path) -> None:

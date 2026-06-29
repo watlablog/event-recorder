@@ -44,6 +44,7 @@ class FakeCv2:
     FONT_HERSHEY_SIMPLEX = 0
     LINE_AA = 0
     rectangle_calls = []
+    text_calls = []
 
     @staticmethod
     def VideoWriter_fourcc(*args):
@@ -55,8 +56,13 @@ class FakeCv2:
         frame[:, :, 1] = 255
 
     @staticmethod
-    def putText(*args, **kwargs):
-        pass
+    def getTextSize(text, font, scale, thickness):
+        return (len(text) * 10, 20), 5
+
+    @staticmethod
+    def putText(frame, text, org, font, scale, color, thickness, line_type):
+        FakeCv2.text_calls.append((text, org, color, thickness))
+        frame[:, :, 2] = 255
 
 
 def test_video_writer_falls_back_to_video_only_when_mux_fails(
@@ -119,6 +125,7 @@ def test_video_writer_falls_back_to_video_only_when_mux_fails(
     assert metadata["audio_requested"] is True
     assert metadata["audio_recorded"] is False
     assert metadata["audio_status"] == "mux_failed"
+    assert metadata["draw_timestamp"] is False
     assert metadata["night_enhancement_enabled"] is True
     assert metadata["night_enhancement_contrast"] == 1.35
     assert metadata["night_enhancement_brightness"] == 12.0
@@ -128,6 +135,7 @@ def test_video_writer_falls_back_to_video_only_when_mux_fails(
 def test_video_writer_draws_boxes_when_enabled(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "cv2", FakeCv2)
     FakeCv2.rectangle_calls = []
+    FakeCv2.text_calls = []
     paths = EventPaths(
         event_id="event",
         part=1,
@@ -180,3 +188,57 @@ def test_video_writer_draws_boxes_when_enabled(monkeypatch, tmp_path):
     assert FakeCv2.rectangle_calls
     assert FakeVideoWriter.written_frames[0][:, :, 1].max() == 255
     assert frame[:, :, 1].max() == 0
+
+
+def test_video_writer_draws_timestamp_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "cv2", FakeCv2)
+    FakeCv2.rectangle_calls = []
+    FakeCv2.text_calls = []
+    paths = EventPaths(
+        event_id="event",
+        part=1,
+        partial_video_path=tmp_path / "event_partial.mp4",
+        partial_audio_path=tmp_path / "event_partial.wav",
+        muxed_partial_video_path=tmp_path / "event_muxed_partial.mp4",
+        final_video_path=tmp_path / "event.mp4",
+        metadata_path=tmp_path / "event.json",
+    )
+    writer = VideoClipWriter(
+        paths=paths,
+        recording=RecordingConfig(
+            output_directory=tmp_path,
+            extension="mp4",
+            fourcc="mp4v",
+            pre_event_seconds=1.0,
+            post_event_seconds=3.0,
+            max_clip_seconds=600,
+            max_prebuffer_mb=256,
+            minimum_free_disk_gb=0,
+            draw_timestamp=True,
+        ),
+        source=0,
+        model_path="model.pt",
+        target_classes=("person",),
+        night_enhancement=_night_config(),
+        fps=30.0,
+        frame_size=(640, 480),
+        started_at_wall_clock=datetime(2026, 6, 29, tzinfo=timezone.utc),
+        started_at_monotonic=1.0,
+    )
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    writer.write(
+        FramePacket(
+            frame_id=1,
+            captured_at_monotonic=1.0,
+            captured_at_wall_clock=datetime(2026, 6, 29, 12, 34, 56, tzinfo=timezone.utc),
+            frame=frame,
+        )
+    )
+
+    assert [call[2] for call in FakeCv2.text_calls] == [
+        (0, 0, 0),
+        (255, 255, 255),
+    ]
+    assert FakeCv2.text_calls[0][0] == "2026-06-29 12:34:56"
+    assert FakeVideoWriter.written_frames[0][:, :, 2].max() == 255
+    assert frame[:, :, 2].max() == 0

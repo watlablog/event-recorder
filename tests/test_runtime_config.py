@@ -54,6 +54,20 @@ def test_runtime_config_replaces_recording_draw_boxes():
     assert config.recording.draw_boxes is False
 
 
+def test_runtime_config_replaces_recording_draw_timestamp():
+    config = parse_config({"model": {"target_classes": ["person", "car"]}})
+
+    updated = with_runtime_selection(
+        config,
+        camera_source=1,
+        target_classes=("person",),
+        recording_draw_timestamp=True,
+    )
+
+    assert updated.recording.draw_timestamp is True
+    assert config.recording.draw_timestamp is False
+
+
 def test_config_parses_recording_draw_boxes():
     config = parse_config(
         {
@@ -63,6 +77,17 @@ def test_config_parses_recording_draw_boxes():
     )
 
     assert config.recording.draw_boxes is True
+
+
+def test_config_parses_recording_draw_timestamp():
+    config = parse_config(
+        {
+            "model": {"target_classes": ["person", "car"]},
+            "recording": {"draw_timestamp": True},
+        }
+    )
+
+    assert config.recording.draw_timestamp is True
 
 
 def test_config_parses_night_enhancement_defaults():
